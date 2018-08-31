@@ -114,7 +114,7 @@ func TestUserGuilds(t *testing.T) {
 		t.Skip("Cannot TestUserGuilds, dg not set.")
 	}
 
-	_, err := dg.UserGuilds()
+	_, err := dg.UserGuilds(10, "", "")
 	if err != nil {
 		t.Errorf(err.Error())
 	}
@@ -163,6 +163,17 @@ func TestGateway(t *testing.T) {
 	_, err := dg.Gateway()
 	if err != nil {
 		t.Errorf("Gateway() returned error: %+v", err)
+	}
+}
+
+func TestGatewayBot(t *testing.T) {
+
+	if dgBot == nil {
+		t.Skip("Skipping, dgBot not set.")
+	}
+	_, err := dgBot.GatewayBot()
+	if err != nil {
+		t.Errorf("GatewayBot() returned error: %+v", err)
 	}
 }
 
@@ -216,7 +227,7 @@ func TestGuildMemberNickname(t *testing.T) {
 		t.Skip("Skipping, dg not set.")
 	}
 
-	err := dg.GuildMemberNickname(envGuild, "@me/nick", "testnickname")
+	err := dg.GuildMemberNickname(envGuild, "@me/nick", "B1nzyRocks")
 	if err != nil {
 		t.Errorf("GuildNickname returned error: %+v", err)
 	}

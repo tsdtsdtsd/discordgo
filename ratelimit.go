@@ -3,16 +3,26 @@ package discordgo
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// customRateLimit holds information for defining a custom rate limit
+type customRateLimit struct {
+	suffix   string
+	requests int
+	reset    time.Duration
+}
 
 // RateLimiter holds all ratelimit buckets
 type RateLimiter struct {
 	sync.Mutex
-	global          *Bucket
-	buckets         map[string]*Bucket
-	globalRateLimit time.Duration
+	global           *int64
+	buckets          map[string]*Bucket
+	globalRateLimit  time.Duration
+	customRateLimits []*customRateLimit
 }
 
 // NewRatelimiter returns a new RateLimiter
@@ -20,12 +30,19 @@ func NewRatelimiter() *RateLimiter {
 
 	return &RateLimiter{
 		buckets: make(map[string]*Bucket),
-		global:  &Bucket{Key: "global"},
+		global:  new(int64),
+		customRateLimits: []*customRateLimit{
+			&customRateLimit{
+				suffix:   "//reactions//",
+				requests: 1,
+				reset:    200 * time.Millisecond,
+			},
+		},
 	}
 }
 
-// getBucket retrieves or creates a bucket
-func (r *RateLimiter) getBucket(key string) *Bucket {
+// GetBucket retrieves or creates a bucket
+func (r *RateLimiter) GetBucket(key string) *Bucket {
 	r.Lock()
 	defer r.Unlock()
 
@@ -34,34 +51,54 @@ func (r *RateLimiter) getBucket(key string) *Bucket {
 	}
 
 	b := &Bucket{
-		remaining: 1,
+		Remaining: 1,
 		Key:       key,
 		global:    r.global,
+	}
+
+	// Check if there is a custom ratelimit set for this bucket ID.
+	for _, rl := range r.customRateLimits {
+		if strings.HasSuffix(b.Key, rl.suffix) {
+			b.customRateLimit = rl
+			break
+		}
 	}
 
 	r.buckets[key] = b
 	return b
 }
 
-// LockBucket Locks until a request can be made
-func (r *RateLimiter) LockBucket(bucketID string) *Bucket {
-
-	b := r.getBucket(bucketID)
-
-	b.Lock()
-
+// GetWaitTime returns the duration you should wait for a Bucket
+func (r *RateLimiter) GetWaitTime(b *Bucket, minRemaining int) time.Duration {
 	// If we ran out of calls and the reset time is still ahead of us
 	// then we need to take it easy and relax a little
-	if b.remaining < 1 && b.reset.After(time.Now()) {
-		time.Sleep(b.reset.Sub(time.Now()))
-
+	if b.Remaining < minRemaining && b.reset.After(time.Now()) {
+		return b.reset.Sub(time.Now())
 	}
 
 	// Check for global ratelimits
-	r.global.Lock()
-	r.global.Unlock()
+	sleepTo := time.Unix(0, atomic.LoadInt64(r.global))
+	if now := time.Now(); now.Before(sleepTo) {
+		return sleepTo.Sub(now)
+	}
 
-	b.remaining--
+	return 0
+}
+
+// LockBucket Locks until a request can be made
+func (r *RateLimiter) LockBucket(bucketID string) *Bucket {
+	return r.LockBucketObject(r.GetBucket(bucketID))
+}
+
+// LockBucketObject Locks an already resolved bucket until a request can be made
+func (r *RateLimiter) LockBucketObject(b *Bucket) *Bucket {
+	b.Lock()
+
+	if wait := r.GetWaitTime(b, 1); wait > 0 {
+		time.Sleep(wait)
+	}
+
+	b.Remaining--
 	return b
 }
 
@@ -69,17 +106,33 @@ func (r *RateLimiter) LockBucket(bucketID string) *Bucket {
 type Bucket struct {
 	sync.Mutex
 	Key       string
-	remaining int
+	Remaining int
 	limit     int
 	reset     time.Time
-	global    *Bucket
+	global    *int64
+
+	lastReset       time.Time
+	customRateLimit *customRateLimit
+	Userdata        interface{}
 }
 
 // Release unlocks the bucket and reads the headers to update the buckets ratelimit info
 // and locks up the whole thing in case if there's a global ratelimit.
 func (b *Bucket) Release(headers http.Header) error {
-
 	defer b.Unlock()
+
+	// Check if the bucket uses a custom ratelimiter
+	if rl := b.customRateLimit; rl != nil {
+		if time.Now().Sub(b.lastReset) >= rl.reset {
+			b.Remaining = rl.requests - 1
+			b.lastReset = time.Now()
+		}
+		if b.Remaining < 1 {
+			b.reset = time.Now().Add(rl.reset)
+		}
+		return nil
+	}
+
 	if headers == nil {
 		return nil
 	}
@@ -89,41 +142,25 @@ func (b *Bucket) Release(headers http.Header) error {
 	global := headers.Get("X-RateLimit-Global")
 	retryAfter := headers.Get("Retry-After")
 
-	// If it's global just keep the main ratelimit mutex locked
-	if global != "" {
-		parsedAfter, err := strconv.Atoi(retryAfter)
-		if err != nil {
-			return err
-		}
-
-		// Lock it in a new goroutine so that this isn't a blocking call
-		go func() {
-			// Make sure if several requests were waiting we don't sleep for n * retry-after
-			// where n is the amount of requests that were going on
-			sleepTo := time.Now().Add(time.Duration(parsedAfter) * time.Millisecond)
-
-			b.global.Lock()
-
-			sleepDuration := sleepTo.Sub(time.Now())
-			if sleepDuration > 0 {
-				time.Sleep(sleepDuration)
-			}
-
-			b.global.Unlock()
-		}()
-
-		return nil
-	}
-
-	// Update reset time if either retry after or reset headers are present
-	// Prefer retryafter because it's more accurate with time sync and whatnot
+	// Update global and per bucket reset time if the proper headers are available
+	// If global is set, then it will block all buckets until after Retry-After
+	// If Retry-After without global is provided it will use that for the new reset
+	// time since it's more accurate than X-RateLimit-Reset.
+	// If Retry-After after is not proided, it will update the reset time from X-RateLimit-Reset
 	if retryAfter != "" {
 		parsedAfter, err := strconv.ParseInt(retryAfter, 10, 64)
 		if err != nil {
 			return err
 		}
-		b.reset = time.Now().Add(time.Duration(parsedAfter) * time.Millisecond)
 
+		resetAt := time.Now().Add(time.Duration(parsedAfter) * time.Millisecond)
+
+		// Lock either this single bucket or all buckets
+		if global != "" {
+			atomic.StoreInt64(b.global, resetAt.UnixNano())
+		} else {
+			b.reset = resetAt
+		}
 	} else if reset != "" {
 		// Calculate the reset time by using the date header returned from discord
 		discordTime, err := http.ParseTime(headers.Get("Date"))
@@ -150,7 +187,7 @@ func (b *Bucket) Release(headers http.Header) error {
 		if err != nil {
 			return err
 		}
-		b.remaining = int(parsedRemaining)
+		b.Remaining = int(parsedRemaining)
 	}
 
 	return nil
