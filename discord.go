@@ -14,13 +14,17 @@
 package discordgo
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 )
 
-// VERSION of Discordgo, follows Symantic Versioning. (http://semver.org/)
-const VERSION = "0.16.0-dev"
+// VERSION of DiscordGo, follows Semantic Versioning. (http://semver.org/)
+const VERSION = "0.18.0"
+
+// ErrMFA will be risen by New when the user has 2FA.
+var ErrMFA = errors.New("account has 2FA enabled")
 
 // New creates a new Discord session and will automate some startup
 // tasks if given enough information to do so.  Currently you can pass zero
@@ -35,12 +39,18 @@ const VERSION = "0.16.0-dev"
 //     With an email, password and auth token - Discord will verify the auth
 //         token, if it is invalid it will sign in with the provided
 //         credentials. This is the Discord recommended way to sign in.
+//
+// NOTE: While email/pass authentication is supported by DiscordGo it is
+// HIGHLY DISCOURAGED by Discord. Please only use email/pass to obtain a token
+// and then use that authentication token for all future connections.
+// Also, doing any form of automation with a user (non Bot) account may result
+// in that account being permanently banned from Discord.
 func New(args ...interface{}) (s *Session, err error) {
 
 	// Create an empty Session interface.
 	s = &Session{
 		State:                  NewState(),
-		ratelimiter:            NewRatelimiter(),
+		Ratelimiter:            NewRatelimiter(),
 		StateEnabled:           true,
 		Compress:               true,
 		ShouldReconnectOnError: true,
@@ -49,6 +59,7 @@ func New(args ...interface{}) (s *Session, err error) {
 		MaxRestRetries:         3,
 		Client:                 &http.Client{Timeout: (20 * time.Second)},
 		sequence:               new(int64),
+		LastHeartbeatAck:       time.Now().UTC(),
 	}
 
 	// If no arguments are passed return the empty Session interface.
@@ -119,7 +130,11 @@ func New(args ...interface{}) (s *Session, err error) {
 	} else {
 		err = s.Login(auth, pass)
 		if err != nil || s.Token == "" {
-			err = fmt.Errorf("Unable to fetch discord authentication token. %v", err)
+			if s.MFA {
+				err = ErrMFA
+			} else {
+				err = fmt.Errorf("Unable to fetch discord authentication token. %v", err)
+			}
 			return
 		}
 	}
